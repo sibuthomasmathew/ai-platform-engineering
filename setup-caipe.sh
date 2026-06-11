@@ -4378,15 +4378,16 @@ SUPERVISOR_INGRESS_EOF
     # no brokered IdP).
     provision_local_users
 
-    # RAG web-ingestor service account: creates caipe-web-ingestor client in
-    # Keycloak and stores credentials in rag-ingestor-secret. Must run after
-    # Keycloak is ready and before helm install so the secret exists when the
-    # rag-server and web-ingestor pods start.
-    provision_rag_ingestor_client
-
     # Add aud=caipe-ui to user access tokens so the Next.js gateway accepts
     # bearer auth on dynamic-agents streaming endpoints.
     provision_caipe_ui_audience_mapper
+  fi
+
+  # RAG web-ingestor service account: create the caipe-web-ingestor Keycloak client
+  # and store credentials in rag-ingestor-secret. Runs regardless of CAIPE_DOMAIN so
+  # both domain and no-domain installs get the secret after Keycloak is ready.
+  if $ENABLE_RAG; then
+    provision_rag_ingestor_client
   fi
 }
 
@@ -4492,7 +4493,17 @@ JSON
 # assisted-by claude code claude-sonnet-4-6
 provision_rag_ingestor_client() {
   $ENABLE_RAG || return 0
-  [[ -n "${CAIPE_DOMAIN:-}" ]] || return 0
+
+  # Issuer URL: use the public HTTPS endpoint when a domain is configured so
+  # browser-side OIDC discovery works. Fall back to the in-cluster service URL
+  # when there is no public domain — the web-ingestor always connects via
+  # localhost and only ever needs the in-cluster endpoint.
+  local issuer
+  if [[ -n "${CAIPE_DOMAIN:-}" ]]; then
+    issuer="https://${CAIPE_DOMAIN}/realms/caipe"
+  else
+    issuer="http://caipe-keycloak:8080/realms/caipe"
+  fi
 
   local kcadm_user kcadm_pw="${KEYCLOAK_ADMIN_PASSWORD:-}"
   kcadm_user=$(kubectl get secret caipe-keycloak-admin -n caipe \
@@ -4525,9 +4536,7 @@ provision_rag_ingestor_client() {
   fi
 
   local client_id="caipe-web-ingestor"
-  local issuer="https://${CAIPE_DOMAIN}/realms/caipe"
 
-  # Check if client already exists
   local existing_uuid
   existing_uuid=$(curl -s -H "Authorization: Bearer $tok" \
     "$kc/admin/realms/caipe/clients?clientId=${client_id}" \
@@ -4541,7 +4550,6 @@ provision_rag_ingestor_client() {
       | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
     log "RAG ingestor client: reused existing '${client_id}', refreshed secret"
   else
-    # Create the client
     local create_body
     create_body=$(cat <<JSON
 {
@@ -4603,7 +4611,6 @@ JSON
     return 0
   fi
 
-  # Store in k8s secret so both rag-server and web-ingestor can mount it via envFrom
   kubectl create secret generic rag-ingestor-secret -n caipe \
     --from-literal=INGESTOR_OIDC_ISSUER="${issuer}" \
     --from-literal=INGESTOR_OIDC_CLIENT_ID="${client_id}" \
@@ -6376,12 +6383,35 @@ DAEOF
       --set 'supervisor-agent.env.RAG_SERVER_URL=http://rag-server:9446'
       --set 'rag-stack.rag-server.env.SKIP_INIT_TESTS=true'
     )
+    # On upgrades rag-ingestor-secret already exists from a prior run of
+    # post_deploy_patches. Read it now so webIngestor.enabled=true is passed
+    # to helm without waiting for post_deploy_patches to run again.
+    if [[ "${RAG_INGESTOR_SECRET_READY:-false}" != "true" ]]; then
+      local _ri_issuer _ri_client
+      _ri_issuer=$(kubectl get secret rag-ingestor-secret -n caipe \
+        -o jsonpath='{.data.INGESTOR_OIDC_ISSUER}' 2>/dev/null | base64 -d || true)
+      _ri_client=$(kubectl get secret rag-ingestor-secret -n caipe \
+        -o jsonpath='{.data.INGESTOR_OIDC_CLIENT_ID}' 2>/dev/null | base64 -d || true)
+      if [[ -n "$_ri_issuer" && -n "$_ri_client" ]]; then
+        RAG_INGESTOR_SECRET_READY=true
+        RAG_INGESTOR_OIDC_ISSUER="$_ri_issuer"
+        RAG_INGESTOR_OIDC_CLIENT_ID="$_ri_client"
+        log "RAG ingestor: existing rag-ingestor-secret detected (issuer=${_ri_issuer})"
+      fi
+    fi
     # Wire UI OIDC provider into rag-server so user tokens are validated.
     if [[ -n "${CAIPE_DOMAIN:-}" ]]; then
       helm_args+=(
         --set "rag-stack.rag-server.env.OIDC_ISSUER=https://${CAIPE_DOMAIN}/realms/caipe"
         --set 'rag-stack.rag-server.env.OIDC_CLIENT_ID=caipe-ui'
-        --set 'rag-stack.rag-server.env.OIDC_GROUP_CLAIM=members,groups'
+        --set 'rag-stack.rag-server.env.OIDC_GROUP_CLAIM=members\,groups'
+      )
+    elif $ENABLE_RBAC_RUNTIME; then
+      # No domain: the rag-server can only reach Keycloak via the in-cluster service.
+      helm_args+=(
+        --set 'rag-stack.rag-server.env.OIDC_ISSUER=http://caipe-keycloak:8080/realms/caipe'
+        --set 'rag-stack.rag-server.env.OIDC_CLIENT_ID=caipe-ui'
+        --set 'rag-stack.rag-server.env.OIDC_GROUP_CLAIM=members\,groups'
       )
     fi
     # Wire Keycloak client credentials into both rag-server (token validation)
